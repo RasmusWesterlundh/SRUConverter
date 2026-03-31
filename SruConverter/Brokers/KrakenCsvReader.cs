@@ -243,48 +243,60 @@ public class KrakenCsvReader : IBrokerReader
         }
         else if (!spendIsFiat && !receiveIsFiat)
         {
-            // SWAP: crypto → crypto (taxable — treat as SELL then BUY at same timestamp)
-            // The "value" of the swap is determined by the receive side in its fiat equivalent.
-            // Since we may not know the rate for the sent crypto directly (it might not have a
-            // Riksbanken series), we back-calculate from the received asset if it's a stablecoin.
+            // SWAP: crypto → crypto — simultaneously a taxable disposal and a new acquisition.
+            // Per Skatteverket: Försäljningspris of swapped-away asset = market value of
+            // received asset in SEK. Same amount becomes Omkostnadsbelopp of received asset.
+            //
+            // Fee is paid in the spend asset and is also a disposal (deducted from holdings).
+            // Total spend-asset disposed = spendAmt + spendFee.
+            // Proceeds = market value of what was *received* (fee does not come back as receive asset).
             Console.WriteLine(
                 $"  NOTE: Crypto swap {spendAsset}→{receiveAsset} on {date} — " +
                 "treating as SELL of source and BUY of target at spot value.");
 
-            // Try to get SEK value from the receive side (e.g. if receiving a USD stablecoin)
+            var totalSpendQty = spendAmt + spendFee; // fee is paid in the spend asset
+
+            // Determine SEK proceeds:
+            // 1. If receive side is a stablecoin (USDT/USDC/…), use receiveAmt × stablecoinRate.
+            // 2. Fall back to spend side if it is a stablecoin — spendAmt × rate (fee excluded;
+            //    per Skatteverket proceeds = value of what you received, not what you gave away).
+            // 3. Otherwise warn — the user must enter this trade manually.
             long proceedsSek = 0L;
             string? receiveQuote = TryGetFiatEquivalent(receiveAsset);
+            string? spendQuote   = TryGetFiatEquivalent(spendAsset);
+
             if (receiveQuote != null)
             {
-                decimal fiatRate = await GetRate(riksbank, receiveQuote, date, loggedKeys);
-                proceedsSek = RoundSek(receiveAmt * fiatRate);
+                // Prefer receive-side: we know the exact fiat value of what was received.
+                decimal rate = await GetRate(riksbank, receiveQuote, date, loggedKeys);
+                proceedsSek  = RoundSek(receiveAmt * rate);
+            }
+            else if (spendQuote != null)
+            {
+                // Spend side is a stablecoin: proceeds ≈ spendAmt × rate.
+                // (The fee portion reduced net gain; it is captured via higher totalSpendQty cost.)
+                decimal rate = await GetRate(riksbank, spendQuote, date, loggedKeys);
+                proceedsSek  = RoundSek(spendAmt * rate);
             }
             else
             {
-                // No known fiat equivalent — skip SELL, just record BUY at zero cost basis.
                 Console.WriteLine(
-                    $"  WARNING: Cannot determine SEK value for {receiveAsset}. " +
-                    $"Skipping K4 row for the disposal of {spendAsset}. " +
-                    "You may need to enter this manually.");
+                    $"  WARNING: Cannot determine SEK value for swap {spendAsset}→{receiveAsset}. " +
+                    "Neither asset is a recognised stablecoin. " +
+                    "You may need to enter this trade manually on K4.");
             }
 
-            // SELL of spend asset at the proceeds value
-            if (proceedsSek > 0)
-            {
-                var stateSpend = GetOrAdd(avgCost, spendAsset);
-                if (stateSpend.HeldQty < spendAmt * 0.999m)
-                    Console.WriteLine(
-                        $"  WARNING: Disposing of {spendAmt:F8} {spendAsset} but only " +
-                        $"{stateSpend.HeldQty:F8} tracked.");
-                var costSek = stateSpend.Sell(spendAmt);
-                rows.Add(MakeRow(spendAsset, spendAmt, date, proceedsSek, costSek));
-            }
-            else
-            {
-                GetOrAdd(avgCost, spendAsset).Sell(spendAmt); // still deduct from holdings
-            }
+            // SELL of spend asset (always emit K4 row so it is never silently dropped)
+            var stateSpend = GetOrAdd(avgCost, spendAsset);
+            if (stateSpend.HeldQty < totalSpendQty * 0.999m)
+                Console.WriteLine(
+                    $"  WARNING: Disposing of {totalSpendQty:F8} {spendAsset} but only " +
+                    $"{stateSpend.HeldQty:F8} tracked.");
 
-            // BUY of receive asset at the proceeds value
+            var costSek = stateSpend.Sell(totalSpendQty);
+            rows.Add(MakeRow(spendAsset, totalSpendQty, date, proceedsSek, costSek));
+
+            // BUY of receive asset: cost basis = proceeds (market value at time of swap).
             GetOrAdd(avgCost, receiveAsset).Buy(receiveAmt, proceedsSek);
         }
         // else: fiat→fiat or unhandled — ignore
