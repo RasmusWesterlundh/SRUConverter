@@ -55,12 +55,14 @@ public class KrakenCsvReader : IBrokerReader
         "Log in to Kraken and go to Account Settings -> Documents -> New Export. " +
         "Two export types are relevant for K4:\n\n" +
         "  * Trades (kraken_spot_trades_*.csv): covers spot buy/sell and margin/leveraged trades. " +
-        "Select 'Trades', set the date range to ALL TIME — older purchases are required to " +
-        "correctly compute the average cost basis (genomsnittsmetoden) for any sale in the " +
-        "declared year. Select all pairs and fields, and choose CSV format.\n\n" +
+        "Select 'Trades'. For the date range, include your full purchase history for any asset " +
+        "you sold in the declared year — prior purchases determine the average cost basis " +
+        "under genomsnittsmetoden, even if those purchases were in earlier tax years. " +
+        "Prior-year sales are automatically excluded from the K4 output. " +
+        "Select all pairs and fields, and choose CSV format.\n\n" +
         "  * Ledger (kraken_stocks_etfs_ledgers_*.csv): covers crypto-to-crypto conversions " +
         "(e.g. swapping stablecoins or altcoins) that appear as spend/receive pairs in the ledger " +
-        "rather than in the Trades export. Select 'Ledger', use the same full date range, " +
+        "rather than in the Trades export. Select 'Ledger', use the same date range, " +
         "and choose CSV format.\n\n" +
         "You can add both files at the same time — this reader handles each format automatically. " +
         "Note: staking rewards (earn) in the Ledger are skipped here; they are income (Tjänst), " +

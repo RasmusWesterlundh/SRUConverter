@@ -34,9 +34,11 @@ public class RevolutCsvReader : IBrokerReader
     public string HelpText =>
         "Open the Revolut app and go to Profile -> Documents & Statements -> New Export.\n\n" +
         "  * Crypto Account Statement (crypto-account-statement_*.csv): " +
-        "Select 'Account Statement', choose 'Crypto' as the account type, set the date range " +
-        "to cover your FULL history (not just the current year — all past purchases affect the " +
-        "average cost basis under genomsnittsmetoden), and export as CSV. " +
+        "Select 'Account Statement', choose 'Crypto' as the account type. " +
+        "For the date range, include your full purchase history for any asset you sold in the " +
+        "declared year — prior purchases determine the average cost basis (genomsnittsmetoden), " +
+        "even if those purchases were in earlier tax years. Prior-year sales are automatically " +
+        "excluded from the K4 output. Export as CSV. " +
         "This file contains raw Buy, Sell, Send, and Learn reward events with values in SEK. " +
         "Send events with a non-zero value are treated as taxable disposals (payment with crypto).\n\n" +
         "  * Trading Account Statement (trading-account-statement_*.csv): " +
