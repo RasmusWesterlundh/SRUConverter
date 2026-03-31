@@ -196,7 +196,7 @@ public class KrakenCsvReader : IBrokerReader
                         : costSek - RoundSek(Math.Abs(netPnl) * rate);
                 }
 
-                rows.Add(MakeRow(baseAsset + " (h\u00e4vst\u00e5ng)", t.Vol, date, proceedsSek, costSek));
+                rows.Add(MakeRow(baseAsset, t.Vol, date, proceedsSek, costSek));
             }
         }
 
