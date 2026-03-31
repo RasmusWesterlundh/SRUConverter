@@ -11,5 +11,6 @@ public static class BrokerRegistry
     [
         new AvanzaCsvReader(),
         new RevolutCsvReader(),
+        new KrakenCsvReader(),
     ];
 }
