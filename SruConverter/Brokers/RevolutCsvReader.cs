@@ -32,18 +32,22 @@ public class RevolutCsvReader : IBrokerReader
     public string   FilePrompt          => "Crypto Account Statement and/or Trading Account Statement CSV";
 
     public string HelpText =>
-        "Open the Revolut app and go to Account Settings -> Documents & Statements -> New Export.\n\n" +
+        "Open the Revolut app and go to Profile -> Documents & Statements -> New Export.\n\n" +
         "  * Crypto Account Statement (crypto-account-statement_*.csv): " +
-        "Select 'Account Statement', choose 'Crypto' as the account type, set the date range, " +
-        "and export as CSV. This file contains all Buy, Sell, Send, and Learn reward transactions " +
-        "with values already expressed in SEK.\n\n" +
+        "Select 'Account Statement', choose 'Crypto' as the account type, set the date range " +
+        "to cover your FULL history (not just the current year — all past purchases affect the " +
+        "average cost basis under genomsnittsmetoden), and export as CSV. " +
+        "This file contains raw Buy, Sell, Send, and Learn reward events with values in SEK. " +
+        "Send events with a non-zero value are treated as taxable disposals (payment with crypto).\n\n" +
         "  * Trading Account Statement (trading-account-statement_*.csv): " +
-        "Same path but choose 'Trading' as the account type (or use the old Consolidated Statement). " +
-        "This file contains disposal events with Revolut's pre-computed cost basis, " +
-        "which is used as a fallback when the crypto-account file is not provided.\n\n" +
-        "Providing BOTH files gives the most accurate results. The crypto-account file is " +
-        "used for acquisitions and explicit sells; the trading-account file covers assets " +
-        "transferred out (Send) that are not present in the crypto-account file.";
+        "Same path but choose 'Trading Account' as the account type. " +
+        "This file lists disposal events with Revolut's own pre-computed cost basis, used as a " +
+        "fallback when the shared average-cost history is insufficient. " +
+        "Assets already covered by Sell or Send events in the crypto-account file are " +
+        "automatically skipped to avoid double-counting.\n\n" +
+        "Providing BOTH files gives the most accurate results: the crypto-account file " +
+        "establishes the full acquisition history, while the trading-account file handles " +
+        "disposals of assets like BTC that were transferred out (Send) without an explicit Sell.";
 
     public string HelpUrl => "https://www.revolut.com/help/profile/documents-and-statements/how-do-i-get-a-statement/";
 

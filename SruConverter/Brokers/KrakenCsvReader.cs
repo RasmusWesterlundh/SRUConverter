@@ -53,15 +53,18 @@ public class KrakenCsvReader : IBrokerReader
 
     public string HelpText =>
         "Log in to Kraken and go to Account Settings -> Documents -> New Export. " +
-        "Two export types are useful for K4:\n\n" +
+        "Two export types are relevant for K4:\n\n" +
         "  * Trades (kraken_spot_trades_*.csv): covers spot buy/sell and margin/leveraged trades. " +
-        "Select 'Trades', choose your date range (recommend 'All time' for accurate cost basis), " +
-        "select All pairs and fields, and choose CSV format.\n\n" +
-        "  * Stocks & ETFs Ledger (kraken_stocks_etfs_ledgers_*.csv): covers crypto conversions " +
-        "(e.g. buying/selling meme coins or stablecoins) that do NOT appear in the Trades export. " +
-        "Select 'Ledger', choose your date range, and choose CSV format.\n\n" +
-        "You can add both files at the same time - this reader handles each format automatically. " +
-        "Note: staking rewards (earn) are not imported here as they are treated as income, not capital gains.";
+        "Select 'Trades', set the date range to ALL TIME — older purchases are required to " +
+        "correctly compute the average cost basis (genomsnittsmetoden) for any sale in the " +
+        "declared year. Select all pairs and fields, and choose CSV format.\n\n" +
+        "  * Ledger (kraken_stocks_etfs_ledgers_*.csv): covers crypto-to-crypto conversions " +
+        "(e.g. swapping stablecoins or altcoins) that appear as spend/receive pairs in the ledger " +
+        "rather than in the Trades export. Select 'Ledger', use the same full date range, " +
+        "and choose CSV format.\n\n" +
+        "You can add both files at the same time — this reader handles each format automatically. " +
+        "Note: staking rewards (earn) in the Ledger are skipped here; they are income (Tjänst), " +
+        "not capital gains, and must be declared separately.";
 
     public string HelpUrl => "https://www.kraken.com/c/account-settings/documents";
 
