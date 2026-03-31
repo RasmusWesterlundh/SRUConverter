@@ -56,7 +56,13 @@ foreach (var evt in allEvents)
     }
     else // Sell
     {
+        // Always update shared state (prior-year sells reduce holdings and affect
+        // the running average for subsequent purchases — genomsnittsmetoden spans all years).
         var (computedCost, sufficient) = cryptoState.Sell(evt.Asset, evt.Quantity);
+
+        // Only emit a K4 row for disposals that fall within the declared tax year.
+        if (DateOnly.FromDateTime(evt.Timestamp).Year != year) continue;
+
         long costSek;
 
         if (sufficient)
