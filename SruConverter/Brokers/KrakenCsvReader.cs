@@ -29,6 +29,23 @@ namespace SruConverter.Brokers;
 /// </summary>
 public class KrakenCsvReader : IBrokerReader
 {
+    // Cache parsed file contents so GetTradeEventsAsync and GetDirectRowsAsync
+    // (both called by Program.cs with the same file list) don't read and parse
+    // each file twice.
+    private readonly Dictionary<string, (List<KrakenTrade> Trades, List<KrakenTradeSwap> Swaps)>
+        _parseCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private (List<KrakenTrade> Trades, List<KrakenTradeSwap> Swaps) GetParsed(string path)
+    {
+        if (_parseCache.TryGetValue(path, out var hit)) return hit;
+        var lines = File.ReadAllLines(path, System.Text.Encoding.UTF8);
+        var first = lines.Length > 0 ? lines[0] : "";
+        var result = IsTradesHeader(first) ? (ParseTradesFile(lines), new List<KrakenTradeSwap>())
+                   : IsLedgerHeader(first) ? (new List<KrakenTrade>(), ParseLedgerFile(lines))
+                   : (new List<KrakenTrade>(), new List<KrakenTradeSwap>());
+        _parseCache[path] = result;
+        return result;
+    }
     public string   BrokerName          => "Kraken";
     public string[] SupportedExtensions => [".csv"];
     public string   FilePrompt          =>
@@ -77,68 +94,49 @@ public class KrakenCsvReader : IBrokerReader
         var events     = new List<TradeEvent>();
         var loggedKeys = new HashSet<string>();
         var tradeRows  = new List<KrakenTrade>();
-        var ledgerRows = new List<KrakenLedgerEntry>();
+        var swapRows   = new List<KrakenTradeSwap>();
 
         foreach (var path in filePaths)
         {
-            var lines     = File.ReadAllLines(path, System.Text.Encoding.UTF8);
-            var firstLine = lines.Length > 0 ? lines[0] : "";
-
-            if (IsTradesHeader(firstLine))
-                tradeRows.AddRange(ParseTradesFile(lines));
-            else if (IsLedgerHeader(firstLine))
-                ledgerRows.AddRange(ParseLedgerFile(lines));
-            else
+            var (trades, swaps) = GetParsed(path);
+            if (trades.Count == 0 && swaps.Count == 0)
                 Console.WriteLine($"  WARNING: Skipping unrecognised file format: {Path.GetFileName(path)}");
+            tradeRows.AddRange(trades);
+            swapRows.AddRange(swaps);
         }
 
-        // Build a merged chronological timeline of spot trades + ledger entries.
-        var timeline = new List<(DateTime Time, object Entry)>();
-        foreach (var t in tradeRows)
-            if (t.Margin == 0m) // spot only - margin goes to GetDirectRowsAsync
-                timeline.Add((t.Time, t));
-        foreach (var l in ledgerRows)
-            timeline.Add((l.Time, l));
-        timeline.Sort((a, b) => a.Time.CompareTo(b.Time));
+        // Merge spot trades and swaps chronologically using a two-pointer approach.
+        var spotTrades = tradeRows.Where(t => t.Margin == 0m)
+                                  .OrderBy(t => t.Time).ToList();
+        swapRows.Sort((a, b) => a.Time.CompareTo(b.Time));
 
-        foreach (var (_, entry) in timeline)
+        int ti = 0, si = 0;
+        while (ti < spotTrades.Count || si < swapRows.Count)
         {
-            if (entry is KrakenTrade trade)
+            bool takeTrade = si >= swapRows.Count ||
+                             (ti < spotTrades.Count && spotTrades[ti].Time <= swapRows[si].Time);
+
+            if (takeTrade)
             {
+                var trade = spotTrades[ti++];
                 var (baseAsset, quoteCurrency) = ParsePair(trade.Pair);
                 var date = DateOnly.FromDateTime(trade.Time);
                 decimal rate = await GetRate(riksbank, quoteCurrency, date, loggedKeys);
 
-                if (trade.Type == "buy")
+                events.Add(new TradeEvent
                 {
-                    events.Add(new TradeEvent
-                    {
-                        Timestamp = trade.Time,
-                        Asset     = baseAsset,
-                        Quantity  = trade.Vol,
-                        ValueSek  = trade.Cost * rate,
-                        FeeSek    = trade.Fee  * rate,
-                        Kind      = TradeKind.Buy,
-                        Source    = "Kraken",
-                    });
-                }
-                else if (trade.Type == "sell")
-                {
-                    events.Add(new TradeEvent
-                    {
-                        Timestamp = trade.Time,
-                        Asset     = baseAsset,
-                        Quantity  = trade.Vol,
-                        ValueSek  = trade.Cost * rate,
-                        FeeSek    = trade.Fee  * rate,
-                        Kind      = TradeKind.Sell,
-                        Source    = "Kraken",
-                    });
-                }
+                    Timestamp = trade.Time,
+                    Asset     = baseAsset,
+                    Quantity  = trade.Vol,
+                    ValueSek  = trade.Cost * rate,
+                    FeeSek    = trade.Fee  * rate,
+                    Kind      = trade.Type == "buy" ? TradeKind.Buy : TradeKind.Sell,
+                    Source    = "Kraken",
+                });
             }
-            else if (entry is KrakenLedgerEntry ledger)
+            else
             {
-                var evts = await BuildLedgerEvents(ledger, riksbank, loggedKeys);
+                var evts = await BuildSwapEvents(swapRows[si++], riksbank, loggedKeys);
                 events.AddRange(evts);
             }
         }
@@ -156,11 +154,9 @@ public class KrakenCsvReader : IBrokerReader
 
         foreach (var path in filePaths)
         {
-            var lines     = File.ReadAllLines(path, System.Text.Encoding.UTF8);
-            var firstLine = lines.Length > 0 ? lines[0] : "";
-            if (!IsTradesHeader(firstLine)) continue;
+            var (tradeRows, _) = GetParsed(path);
+            if (tradeRows.Count == 0) continue;
 
-            var tradeRows = ParseTradesFile(lines);
             tradeRows.Sort((a, b) => a.Time.CompareTo(b.Time));
 
             foreach (var t in tradeRows)
@@ -202,10 +198,10 @@ public class KrakenCsvReader : IBrokerReader
         return rows;
     }
 
-    // -- Ledger event builder --------------------------------------------------
+    // -- Swap event builder ----------------------------------------------------
 
-    private async Task<List<TradeEvent>> BuildLedgerEvents(
-        KrakenLedgerEntry swap, RiksbankService riksbank, HashSet<string> loggedKeys)
+    private async Task<List<TradeEvent>> BuildSwapEvents(
+        KrakenTradeSwap swap, RiksbankService riksbank, HashSet<string> loggedKeys)
     {
         var events = new List<TradeEvent>();
         var date   = DateOnly.FromDateTime(swap.Time);
@@ -359,7 +355,7 @@ public class KrakenCsvReader : IBrokerReader
         return result;
     }
 
-    private static List<KrakenLedgerEntry> ParseLedgerFile(string[] lines)
+    private static List<KrakenTradeSwap> ParseLedgerFile(string[] lines)
     {
         var allRows = new List<RawLedgerRow>();
         var colIdx  = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -406,7 +402,7 @@ public class KrakenCsvReader : IBrokerReader
         }
 
         // Group by refid and pair up spend -> receive
-        var result  = new List<KrakenLedgerEntry>();
+        var result  = new List<KrakenTradeSwap>();
         var grouped = allRows.GroupBy(r => r.RefId);
 
         foreach (var group in grouped)
@@ -415,7 +411,7 @@ public class KrakenCsvReader : IBrokerReader
             var receive = group.FirstOrDefault(r => r.Amount > 0);
             if (spend == null || receive == null) continue;
 
-            result.Add(new KrakenLedgerEntry
+            result.Add(new KrakenTradeSwap
             {
                 Time          = receive.Time,
                 SpendAsset    = spend.Asset,
@@ -591,7 +587,7 @@ public class KrakenCsvReader : IBrokerReader
         public string   Net    { get; init; } = "";
     }
 
-    private sealed class KrakenLedgerEntry
+    private sealed class KrakenTradeSwap
     {
         public DateTime Time          { get; init; }
         public string   SpendAsset    { get; init; } = "";
