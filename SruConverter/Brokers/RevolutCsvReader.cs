@@ -359,7 +359,9 @@ public class RevolutCsvReader : IBrokerReader
     /// </summary>
     private static decimal ParseSekAmount(string s)
     {
-        s = s.Replace("\u202F", "")
+        // Handle both correctly-encoded U+202F and its Mojibake form (U+00E2 U+0080 U+00AF).
+        s = s.Replace("\u00E2\u0080\u00AF", "")
+             .Replace("\u202F", "")
              .Replace(" SEK", "", StringComparison.OrdinalIgnoreCase)
              .Replace(",", "")
              .Trim();
@@ -374,8 +376,12 @@ public class RevolutCsvReader : IBrokerReader
 
     private static bool TryParseCryptoDateTime(string s, out DateTime dt)
     {
-        // Replace narrow no-break space (U+202F) before AM/PM with a regular space.
-        s = s.Replace('\u202F', ' ');
+        // Revolut's CSV contains a narrow no-break space (U+202F) before AM/PM.
+        // In some exports this is correctly encoded as U+202F; in others it appears
+        // as the Mojibake sequence U+00E2 U+0080 U+00AF (the UTF-8 bytes of U+202F
+        // misread as Latin-1 and re-encoded). Handle both cases.
+        s = s.Replace("\u00E2\u0080\u00AF", " ")
+             .Replace("\u202F", " ");
         foreach (var fmt in CryptoDateFormats)
             if (DateTime.TryParseExact(s, fmt, CultureInfo.InvariantCulture,
                     DateTimeStyles.None, out dt)) return true;
