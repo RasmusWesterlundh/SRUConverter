@@ -101,7 +101,7 @@ public class AvanzaCsvReader : IBrokerReader
 
     // ── Reading ───────────────────────────────────────────────────────────────
 
-    public Task<List<K4Row>> ReadAsync(IEnumerable<string> filePaths, RiksbankService _)
+    public Task<List<K4Row>> GetDirectRowsAsync(IEnumerable<string> filePaths, RiksbankService _)
     {
         var rows = new List<K4Row>();
         foreach (var path in filePaths)

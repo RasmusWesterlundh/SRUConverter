@@ -1,59 +1,76 @@
-using System.Globalization;
+﻿using System.Globalization;
 using SruConverter.Models;
 using SruConverter.Services;
 
 namespace SruConverter.Brokers;
 
 /// <summary>
-/// Reads Kraken export files and converts them to K4 rows.
+/// Reads Kraken export files and converts them to TradeEvents (spot) or K4 rows (margin).
 ///
 /// Supports two Kraken CSV formats (auto-detected per file):
 ///
 /// 1. Trades CSV  (kraken_spot_trades_*.csv)
 ///    Columns: txid, ordertxid, pair, aclass, subclass, time, type, ordertype,
 ///             price, cost, fee, vol, margin, misc, ledgers, ...
-///    - Spot trades (margin = 0): genomsnittsmetoden (Swedish average-cost method)
-///    - Margin/leveraged trades (margin > 0): uses the `net` P&L column for
-///      closed positions; open/closing legs without a net value are skipped.
+///    - Spot trades (margin = 0): emitted as TradeEvents for shared genomsnittsmetoden.
+///    - Margin/leveraged trades (margin > 0): emitted as direct K4 rows via GetDirectRowsAsync.
 ///
-/// 2. Stocks &amp; ETFs Ledger CSV  (kraken_stocks_etfs_ledgers_*.csv)
+/// 2. Stocks and ETFs Ledger CSV  (kraken_stocks_etfs_ledgers_*.csv)
 ///    Columns: txid, refid, time, type, subtype, aclass, subclass, asset, wallet,
 ///             amount, fee, balance
 ///    - spend/receive pairs with the same refid represent a completed trade.
 ///    - Supported trade types:
-///        fiat  → crypto   = BUY  (updates genomsnittsmetoden state)
-///        crypto → fiat    = SELL (emits K4 row)
-///        crypto → crypto  = SWAP (SELL of source asset + BUY of target asset)
+///        fiat  to crypto   = TradeEvent.Buy
+///        crypto to fiat    = TradeEvent.Sell
+///        crypto to crypto  = TradeEvent.Sell + TradeEvent.Buy (swap)
 ///    - earn, deposit, withdrawal, and other non-trade types are ignored.
-///
-/// Multiple files of either type can be provided together; average-cost state is
-/// shared across all files so cost basis is calculated correctly across accounts.
-/// For accurate cost basis, export the full trade history ("All time") from Kraken.
 ///
 /// Per Skatteverket, all crypto assets are reported in K4 Sektion D.
 /// </summary>
 public class KrakenCsvReader : IBrokerReader
 {
+    // Cache parsed file contents so GetTradeEventsAsync and GetDirectRowsAsync
+    // (both called by Program.cs with the same file list) don't read and parse
+    // each file twice.
+    private readonly Dictionary<string, (List<KrakenTrade> Trades, List<KrakenTradeSwap> Swaps)>
+        _parseCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private (List<KrakenTrade> Trades, List<KrakenTradeSwap> Swaps) GetParsed(string path)
+    {
+        if (_parseCache.TryGetValue(path, out var hit)) return hit;
+        var lines = File.ReadAllLines(path, System.Text.Encoding.UTF8);
+        var first = lines.Length > 0 ? lines[0] : "";
+        var result = IsTradesHeader(first) ? (ParseTradesFile(lines), new List<KrakenTradeSwap>())
+                   : IsLedgerHeader(first) ? (new List<KrakenTrade>(), ParseLedgerFile(lines))
+                   : (new List<KrakenTrade>(), new List<KrakenTradeSwap>());
+        _parseCache[path] = result;
+        return result;
+    }
     public string   BrokerName          => "Kraken";
     public string[] SupportedExtensions => [".csv"];
     public string   FilePrompt          =>
         "Trades CSV and/or Stocks & ETFs Ledger CSV (kraken_spot_trades_*.csv / kraken_stocks_etfs_ledgers_*.csv)";
 
     public string HelpText =>
-        "Log in to Kraken and go to Account Settings → Documents → New Export. " +
-        "Two export types are useful for K4:\n\n" +
-        "  • Trades (kraken_spot_trades_*.csv): covers spot buy/sell and margin/leveraged trades. " +
-        "Select 'Trades', choose your date range (recommend 'All time' for accurate cost basis), " +
-        "select All pairs and fields, and choose CSV format.\n\n" +
-        "  • Stocks & ETFs Ledger (kraken_stocks_etfs_ledgers_*.csv): covers crypto conversions " +
-        "(e.g. buying/selling meme coins or stablecoins) that do NOT appear in the Trades export. " +
-        "Select 'Ledger', choose your date range, and choose CSV format.\n\n" +
+        "Log in to Kraken and go to Account Settings -> Documents -> New Export. " +
+        "Two export types are relevant for K4:\n\n" +
+        "  * Trades (kraken_spot_trades_*.csv): covers spot buy/sell and margin/leveraged trades. " +
+        "Select 'Trades'. For the date range, include your full purchase history for any asset " +
+        "you sold in the declared year — prior purchases determine the average cost basis " +
+        "under genomsnittsmetoden, even if those purchases were in earlier tax years. " +
+        "Prior-year sales are automatically excluded from the K4 output. " +
+        "Select all pairs and fields, and choose CSV format.\n\n" +
+        "  * Ledger (kraken_stocks_etfs_ledgers_*.csv): covers crypto-to-crypto conversions " +
+        "(e.g. swapping stablecoins or altcoins) that appear as spend/receive pairs in the ledger " +
+        "rather than in the Trades export. Select 'Ledger', use the same date range, " +
+        "and choose CSV format.\n\n" +
         "You can add both files at the same time — this reader handles each format automatically. " +
-        "Note: staking rewards (earn) are not imported here as they are treated as income, not capital gains.";
+        "Note: staking rewards (earn) in the Ledger are skipped here; they are income (Tjänst), " +
+        "not capital gains, and must be declared separately.";
 
     public string HelpUrl => "https://www.kraken.com/c/account-settings/documents";
 
-    // ── Validation ────────────────────────────────────────────────────────────
+    // -- Validation ------------------------------------------------------------
 
     public Task<string?> ValidateFileAsync(string filePath)
     {
@@ -74,235 +91,231 @@ public class KrakenCsvReader : IBrokerReader
         }
     }
 
-    // ── Main reader ───────────────────────────────────────────────────────────
+    // -- GetTradeEventsAsync: spot trades from both CSV formats ----------------
 
-    public async Task<List<K4Row>> ReadAsync(IEnumerable<string> filePaths, RiksbankService riksbank)
+    public async Task<List<TradeEvent>> GetTradeEventsAsync(
+        IEnumerable<string> filePaths, RiksbankService riksbank)
     {
-        // Shared average-cost state across all files (one per base asset).
-        var avgCost    = new Dictionary<string, AssetState>(StringComparer.OrdinalIgnoreCase);
-        var rows       = new List<K4Row>();
+        var events     = new List<TradeEvent>();
         var loggedKeys = new HashSet<string>();
-
-        // ── Pass 1: collect + sort all trades so chronological order is correct
-        //    even when the user provides files covering different date ranges.
         var tradeRows  = new List<KrakenTrade>();
-        var ledgerRows = new List<KrakenLedgerEntry>();
+        var swapRows   = new List<KrakenTradeSwap>();
 
         foreach (var path in filePaths)
         {
-            var lines     = File.ReadAllLines(path, System.Text.Encoding.UTF8);
-            var firstLine = lines.Length > 0 ? lines[0] : "";
-
-            if (IsTradesHeader(firstLine))
-                tradeRows.AddRange(ParseTradesFile(lines));
-            else if (IsLedgerHeader(firstLine))
-                ledgerRows.AddRange(ParseLedgerFile(lines));
-            else
+            var (trades, swaps) = GetParsed(path);
+            if (trades.Count == 0 && swaps.Count == 0)
                 Console.WriteLine($"  WARNING: Skipping unrecognised file format: {Path.GetFileName(path)}");
+            tradeRows.AddRange(trades);
+            swapRows.AddRange(swaps);
         }
 
-        tradeRows.Sort((a, b) => a.Time.CompareTo(b.Time));
+        // Merge spot trades and swaps chronologically using a two-pointer approach.
+        var spotTrades = tradeRows.Where(t => t.Margin == 0m)
+                                  .OrderBy(t => t.Time).ToList();
+        swapRows.Sort((a, b) => a.Time.CompareTo(b.Time));
 
-        // ── Pass 2: process chronologically ──────────────────────────────────
-
-        // Interleave trades + ledger entries by timestamp.
-        // Build a merged timeline so avg-cost state is consistent.
-        var timeline = new List<(DateTime Time, object Entry)>();
-        foreach (var t in tradeRows)   timeline.Add((t.Time,                   t));
-        foreach (var l in ledgerRows)  timeline.Add((l.Time,                   l));
-        timeline.Sort((a, b) => a.Time.CompareTo(b.Time));
-
-        foreach (var (_, entry) in timeline)
+        int ti = 0, si = 0;
+        while (ti < spotTrades.Count || si < swapRows.Count)
         {
-            if (entry is KrakenTrade trade)
-                await ProcessTrade(trade, avgCost, rows, riksbank, loggedKeys);
-            else if (entry is KrakenLedgerEntry ledger)
-                await ProcessLedgerSwap(ledger, avgCost, rows, riksbank, loggedKeys);
+            bool takeTrade = si >= swapRows.Count ||
+                             (ti < spotTrades.Count && spotTrades[ti].Time <= swapRows[si].Time);
+
+            if (takeTrade)
+            {
+                var trade = spotTrades[ti++];
+                var (baseAsset, quoteCurrency) = ParsePair(trade.Pair);
+                var date = DateOnly.FromDateTime(trade.Time);
+                decimal rate = await GetRate(riksbank, quoteCurrency, date, loggedKeys);
+
+                events.Add(new TradeEvent
+                {
+                    Timestamp = trade.Time,
+                    Asset     = baseAsset,
+                    Quantity  = trade.Vol,
+                    ValueSek  = trade.Cost * rate,
+                    FeeSek    = trade.Fee  * rate,
+                    Kind      = trade.Type == "buy" ? TradeKind.Buy : TradeKind.Sell,
+                    Source    = "Kraken",
+                });
+            }
+            else
+            {
+                var evts = await BuildSwapEvents(swapRows[si++], riksbank, loggedKeys);
+                events.AddRange(evts);
+            }
+        }
+
+        return events;
+    }
+
+    // -- GetDirectRowsAsync: margin trades from Trades CSV only ----------------
+
+    public async Task<List<K4Row>> GetDirectRowsAsync(
+        IEnumerable<string> filePaths, RiksbankService riksbank)
+    {
+        var rows       = new List<K4Row>();
+        var loggedKeys = new HashSet<string>();
+
+        foreach (var path in filePaths)
+        {
+            var (tradeRows, _) = GetParsed(path);
+            if (tradeRows.Count == 0) continue;
+
+            tradeRows.Sort((a, b) => a.Time.CompareTo(b.Time));
+
+            foreach (var t in tradeRows)
+            {
+                if (t.Margin == 0m) continue; // spot handled by GetTradeEventsAsync
+
+                // Only initiating legs with a realised net P&L.
+                bool isClosingLeg = t.Misc.Contains("closing", StringComparison.OrdinalIgnoreCase);
+                if (isClosingLeg) continue;
+
+                if (!decimal.TryParse(t.Net, NumberStyles.Any, CultureInfo.InvariantCulture, out var netPnl))
+                    continue; // position not yet closed
+
+                var (baseAsset, quoteCurrency) = ParsePair(t.Pair);
+                var date = DateOnly.FromDateTime(t.Time);
+                decimal rate = await GetRate(riksbank, quoteCurrency, date, loggedKeys);
+
+                long proceedsSek, costSek;
+                if (t.Type == "sell")
+                {
+                    // Opened a short.
+                    proceedsSek = RoundSek((t.Cost - t.Fee) * rate);
+                    costSek     = netPnl < 0
+                        ? proceedsSek + RoundSek(Math.Abs(netPnl) * rate)
+                        : proceedsSek - RoundSek(netPnl * rate);
+                }
+                else // buy (opened a long, now closed)
+                {
+                    costSek     = RoundSek((t.Cost + t.Fee) * rate);
+                    proceedsSek = netPnl > 0
+                        ? costSek + RoundSek(netPnl * rate)
+                        : costSek - RoundSek(Math.Abs(netPnl) * rate);
+                }
+
+                rows.Add(MakeRow(baseAsset + " (h\u00e4vst\u00e5ng)", t.Vol, date, proceedsSek, costSek));
+            }
         }
 
         return rows;
     }
 
-    // ── Trades processing ─────────────────────────────────────────────────────
+    // -- Swap event builder ----------------------------------------------------
 
-    private async Task ProcessTrade(
-        KrakenTrade t,
-        Dictionary<string, AssetState> avgCost,
-        List<K4Row> rows,
-        RiksbankService riksbank,
-        HashSet<string> loggedKeys)
+    private async Task<List<TradeEvent>> BuildSwapEvents(
+        KrakenTradeSwap swap, RiksbankService riksbank, HashSet<string> loggedKeys)
     {
-        var (baseAsset, quoteCurrency) = ParsePair(t.Pair);
-        var date = DateOnly.FromDateTime(t.Time);
-        bool isMargin = t.Margin > 0m;
+        var events = new List<TradeEvent>();
+        var date   = DateOnly.FromDateTime(swap.Time);
 
-        // ── Margin trade ─────────────────────────────────────────────────────
-        if (isMargin)
-        {
-            // Only the initiating leg has a net P&L; closing legs have no net value.
-            bool isClosingLeg = t.Misc.Contains("closing", StringComparison.OrdinalIgnoreCase);
-            if (isClosingLeg) return;
-
-            if (!decimal.TryParse(t.Net, NumberStyles.Any, CultureInfo.InvariantCulture, out var netPnl))
-                return; // position not yet closed — skip
-
-            decimal rate = await GetRate(riksbank, quoteCurrency, date, loggedKeys);
-
-            long proceedsSek, costSek;
-            if (t.Type == "sell")
-            {
-                // Opened a short: received (cost − fee) fiat, later bought back at different price.
-                // net = total P&L of the closed position in quote currency (negative = loss).
-                proceedsSek = RoundSek((t.Cost - t.Fee) * rate);
-                costSek     = netPnl < 0
-                    ? proceedsSek + RoundSek(Math.Abs(netPnl) * rate)  // loss: cost to close was higher
-                    : proceedsSek - RoundSek(netPnl * rate);            // gain: cost to close was lower
-            }
-            else // buy (opened a long, now closed)
-            {
-                costSek     = RoundSek((t.Cost + t.Fee) * rate);
-                proceedsSek = netPnl > 0
-                    ? costSek + RoundSek(netPnl * rate)   // gain
-                    : costSek - RoundSek(Math.Abs(netPnl) * rate); // loss
-            }
-
-            rows.Add(MakeRow(baseAsset + " (hävstång)", t.Vol, date, proceedsSek, costSek));
-            return;
-        }
-
-        // ── Spot trade ────────────────────────────────────────────────────────
-        decimal spotRate = await GetRate(riksbank, quoteCurrency, date, loggedKeys);
-
-        if (t.Type == "buy")
-        {
-            // Total acquisition cost includes the trading fee.
-            var totalCostSek = (t.Cost + t.Fee) * spotRate;
-            GetOrAdd(avgCost, baseAsset).Buy(t.Vol, totalCostSek);
-        }
-        else if (t.Type == "sell")
-        {
-            // Net proceeds after deducting fee.
-            var proceedsSek  = RoundSek((t.Cost - t.Fee) * spotRate);
-            var state        = GetOrAdd(avgCost, baseAsset);
-
-            if (state.HeldQty < t.Vol * 0.999m)
-                Console.WriteLine(
-                    $"  WARNING: Selling {t.Vol:F8} {baseAsset} but only {state.HeldQty:F8} tracked. " +
-                    "Export full trade history ('All time') for an accurate cost basis.");
-
-            var costSek = state.Sell(t.Vol);
-            rows.Add(MakeRow(baseAsset, t.Vol, date, proceedsSek, costSek));
-        }
-    }
-
-    // ── Ledger swap processing ────────────────────────────────────────────────
-
-    private async Task ProcessLedgerSwap(
-        KrakenLedgerEntry swap,
-        Dictionary<string, AssetState> avgCost,
-        List<K4Row> rows,
-        RiksbankService riksbank,
-        HashSet<string> loggedKeys)
-    {
-        // Each KrakenLedgerEntry represents one complete spend→receive pair.
-        var date  = DateOnly.FromDateTime(swap.Time);
-
-        string spendAsset   = swap.SpendAsset;
-        string receiveAsset = swap.ReceiveAsset;
-        decimal spendAmt    = swap.SpendAmount;   // absolute (positive) value
-        decimal spendFee    = swap.SpendFee;
-        decimal receiveAmt  = swap.ReceiveAmount;
-        decimal receiveFee  = swap.ReceiveFee;
+        string  spendAsset   = swap.SpendAsset;
+        string  receiveAsset = swap.ReceiveAsset;
+        decimal spendAmt     = swap.SpendAmount;
+        decimal spendFee     = swap.SpendFee;
+        decimal receiveAmt   = swap.ReceiveAmount;
+        decimal receiveFee   = swap.ReceiveFee;
 
         bool spendIsFiat   = IsFiatAsset(spendAsset);
         bool receiveIsFiat = IsFiatAsset(receiveAsset);
 
         if (spendIsFiat && !receiveIsFiat)
         {
-            // BUY: spent fiat, acquired crypto
-            string fiat     = NormaliseAsset(spendAsset);
+            // BUY: spent fiat, acquired crypto.
+            string  fiat     = NormaliseAsset(spendAsset);
             decimal fiatRate = await GetRate(riksbank, fiat, date, loggedKeys);
-            var totalCostSek = (spendAmt + spendFee) * fiatRate;
-            GetOrAdd(avgCost, receiveAsset).Buy(receiveAmt, totalCostSek);
+            events.Add(new TradeEvent
+            {
+                Timestamp = swap.Time,
+                Asset     = receiveAsset,
+                Quantity  = receiveAmt,
+                ValueSek  = spendAmt * fiatRate,
+                FeeSek    = spendFee * fiatRate,
+                Kind      = TradeKind.Buy,
+                Source    = "Kraken",
+            });
         }
         else if (!spendIsFiat && receiveIsFiat)
         {
-            // SELL: disposed of crypto, received fiat
-            string fiat      = NormaliseAsset(receiveAsset);
+            // SELL: disposed of crypto, received fiat.
+            string  fiat     = NormaliseAsset(receiveAsset);
             decimal fiatRate = await GetRate(riksbank, fiat, date, loggedKeys);
-            var proceedsSek  = RoundSek((receiveAmt - receiveFee) * fiatRate);
-            var state        = GetOrAdd(avgCost, spendAsset);
-
-            if (state.HeldQty < spendAmt * 0.999m)
-                Console.WriteLine(
-                    $"  WARNING: Selling {spendAmt:F8} {spendAsset} but only {state.HeldQty:F8} tracked. " +
-                    "Consider exporting full history for accurate cost basis.");
-
-            var costSek = state.Sell(spendAmt);
-            rows.Add(MakeRow(spendAsset, spendAmt, date, proceedsSek, costSek));
+            events.Add(new TradeEvent
+            {
+                Timestamp = swap.Time,
+                Asset     = spendAsset,
+                Quantity  = spendAmt,
+                ValueSek  = receiveAmt * fiatRate,
+                FeeSek    = receiveFee * fiatRate,
+                Kind      = TradeKind.Sell,
+                Source    = "Kraken",
+            });
         }
         else if (!spendIsFiat && !receiveIsFiat)
         {
-            // SWAP: crypto → crypto — simultaneously a taxable disposal and a new acquisition.
-            // Per Skatteverket: Försäljningspris of swapped-away asset = market value of
-            // received asset in SEK. Same amount becomes Omkostnadsbelopp of received asset.
-            //
-            // Fee is paid in the spend asset and is also a disposal (deducted from holdings).
-            // Total spend-asset disposed = spendAmt + spendFee.
-            // Proceeds = market value of what was *received* (fee does not come back as receive asset).
+            // SWAP: crypto to crypto - taxable disposal of spend asset + acquisition of receive asset.
             Console.WriteLine(
-                $"  NOTE: Crypto swap {spendAsset}→{receiveAsset} on {date} — " +
+                $"  NOTE: Crypto swap {spendAsset}->{receiveAsset} on {date} - " +
                 "treating as SELL of source and BUY of target at spot value.");
 
-            var totalSpendQty = spendAmt + spendFee; // fee is paid in the spend asset
+            // Fee is paid in spend asset, so the full disposal quantity is spendAmt + spendFee.
+            decimal totalSpendQty = spendAmt + spendFee;
 
-            // Determine SEK proceeds:
-            // 1. If receive side is a stablecoin (USDT/USDC/…), use receiveAmt × stablecoinRate.
-            // 2. Fall back to spend side if it is a stablecoin — spendAmt × rate (fee excluded;
-            //    per Skatteverket proceeds = value of what you received, not what you gave away).
-            // 3. Otherwise warn — the user must enter this trade manually.
-            long proceedsSek = 0L;
-            string? receiveQuote = TryGetFiatEquivalent(receiveAsset);
-            string? spendQuote   = TryGetFiatEquivalent(spendAsset);
+            // Determine SEK value: prefer receive side if it is a stablecoin, else spend side.
+            decimal proceedsDecSek = 0m;
+            string? receiveQuote   = TryGetFiatEquivalent(receiveAsset);
+            string? spendQuote     = TryGetFiatEquivalent(spendAsset);
 
             if (receiveQuote != null)
             {
-                // Prefer receive-side: we know the exact fiat value of what was received.
-                decimal rate = await GetRate(riksbank, receiveQuote, date, loggedKeys);
-                proceedsSek  = RoundSek(receiveAmt * rate);
+                decimal rate   = await GetRate(riksbank, receiveQuote, date, loggedKeys);
+                proceedsDecSek = receiveAmt * rate;
             }
             else if (spendQuote != null)
             {
-                // Spend side is a stablecoin: proceeds ≈ spendAmt × rate.
-                // (The fee portion reduced net gain; it is captured via higher totalSpendQty cost.)
-                decimal rate = await GetRate(riksbank, spendQuote, date, loggedKeys);
-                proceedsSek  = RoundSek(spendAmt * rate);
+                decimal rate   = await GetRate(riksbank, spendQuote, date, loggedKeys);
+                proceedsDecSek = spendAmt * rate;
             }
             else
             {
                 Console.WriteLine(
-                    $"  WARNING: Cannot determine SEK value for swap {spendAsset}→{receiveAsset}. " +
+                    $"  WARNING: Cannot determine SEK value for swap {spendAsset}->{receiveAsset}. " +
                     "Neither asset is a recognised stablecoin. " +
                     "You may need to enter this trade manually on K4.");
             }
 
-            // SELL of spend asset (always emit K4 row so it is never silently dropped)
-            var stateSpend = GetOrAdd(avgCost, spendAsset);
-            if (stateSpend.HeldQty < totalSpendQty * 0.999m)
-                Console.WriteLine(
-                    $"  WARNING: Disposing of {totalSpendQty:F8} {spendAsset} but only " +
-                    $"{stateSpend.HeldQty:F8} tracked.");
+            // SELL of spend asset - fee is already included in Quantity, so FeeSek = 0.
+            events.Add(new TradeEvent
+            {
+                Timestamp = swap.Time,
+                Asset     = spendAsset,
+                Quantity  = totalSpendQty,
+                ValueSek  = proceedsDecSek,
+                FeeSek    = 0m,
+                Kind      = TradeKind.Sell,
+                Source    = "Kraken",
+            });
 
-            var costSek = stateSpend.Sell(totalSpendQty);
-            rows.Add(MakeRow(spendAsset, totalSpendQty, date, proceedsSek, costSek));
-
-            // BUY of receive asset: cost basis = proceeds (market value at time of swap).
-            GetOrAdd(avgCost, receiveAsset).Buy(receiveAmt, proceedsSek);
+            // BUY of receive asset: cost basis = market value at time of swap.
+            events.Add(new TradeEvent
+            {
+                Timestamp = swap.Time,
+                Asset     = receiveAsset,
+                Quantity  = receiveAmt,
+                ValueSek  = proceedsDecSek,
+                FeeSek    = 0m,
+                Kind      = TradeKind.Buy,
+                Source    = "Kraken",
+            });
         }
-        // else: fiat→fiat or unhandled — ignore
+        // else: fiat->fiat or unhandled - ignore
+
+        return events;
     }
 
-    // ── File parsers ──────────────────────────────────────────────────────────
+    // -- File parsers ----------------------------------------------------------
 
     private static List<KrakenTrade> ParseTradesFile(string[] lines)
     {
@@ -347,7 +360,7 @@ public class KrakenCsvReader : IBrokerReader
         return result;
     }
 
-    private static List<KrakenLedgerEntry> ParseLedgerFile(string[] lines)
+    private static List<KrakenTradeSwap> ParseLedgerFile(string[] lines)
     {
         var allRows = new List<RawLedgerRow>();
         var colIdx  = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -373,7 +386,7 @@ public class KrakenCsvReader : IBrokerReader
             // Only process spend/receive entries (actual trades).
             // Skip: deposit, withdrawal, earn (rewards), transfer, adjustment.
             if (type is not ("spend" or "receive")) continue;
-            if (subtype is "dustsweeping") continue; // tiny dust conversions — negligible, skip
+            if (subtype is "dustsweeping") continue; // tiny dust conversions - negligible, skip
 
             var timeStr = Get("time");
             if (!TryParseKrakenDateTime(timeStr, out var dt)) continue;
@@ -383,18 +396,18 @@ public class KrakenCsvReader : IBrokerReader
 
             allRows.Add(new RawLedgerRow
             {
-                RefId   = Get("refid"),
-                Time    = dt,
-                Type    = type,
-                Asset   = NormaliseAsset(Get("asset")),
+                RefId    = Get("refid"),
+                Time     = dt,
+                Type     = type,
+                Asset    = NormaliseAsset(Get("asset")),
                 Subclass = Get("subclass").ToLowerInvariant(),
-                Amount  = amount,
-                Fee     = CsvHelper.ParseDecimal(Get("fee")),
+                Amount   = amount,
+                Fee      = CsvHelper.ParseDecimal(Get("fee")),
             });
         }
 
-        // Group by refid and pair up spend → receive
-        var result = new List<KrakenLedgerEntry>();
+        // Group by refid and pair up spend -> receive
+        var result  = new List<KrakenTradeSwap>();
         var grouped = allRows.GroupBy(r => r.RefId);
 
         foreach (var group in grouped)
@@ -403,9 +416,9 @@ public class KrakenCsvReader : IBrokerReader
             var receive = group.FirstOrDefault(r => r.Amount > 0);
             if (spend == null || receive == null) continue;
 
-            result.Add(new KrakenLedgerEntry
+            result.Add(new KrakenTradeSwap
             {
-                Time          = receive.Time, // use receive time as the "trade time"
+                Time          = receive.Time,
                 SpendAsset    = spend.Asset,
                 SpendAmount   = Math.Abs(spend.Amount),
                 SpendFee      = Math.Abs(spend.Fee),
@@ -418,7 +431,7 @@ public class KrakenCsvReader : IBrokerReader
         return result;
     }
 
-    // ── Pair parsing ──────────────────────────────────────────────────────────
+    // -- Pair parsing ----------------------------------------------------------
 
     private static (string Base, string Quote) ParsePair(string pair)
     {
@@ -429,12 +442,11 @@ public class KrakenCsvReader : IBrokerReader
                     pair[(slash + 1)..].Trim().ToUpperInvariant());
 
         // Legacy Kraken format: "XXBTZUSD", "XETHZEUR", etc.
-        // Try known 4-char Z-prefixed fiat suffixes first, then 3-char bare
         foreach (var (suffix, code) in KrakenLegacyQuotes)
             if (pair.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
                 return (NormaliseKrakenBase(pair[..^suffix.Length]), code);
 
-        // Unknown pair — return as-is and hope for the best
+        // Unknown pair - return as-is
         return (pair.ToUpperInvariant(), "USD");
     }
 
@@ -451,13 +463,12 @@ public class KrakenCsvReader : IBrokerReader
             "XXMR"          => "XMR",
             "XZEC"          => "ZEC",
             "XREP"          => "REP",
-            // Strip single leading X for anything else (e.g. XDOT → DOT)
+            // Strip single leading X for anything else (e.g. XDOT -> DOT)
             _ when s.StartsWith('X') && s.Length > 2 => s[1..],
             _ => s,
         };
     }
 
-    // Known legacy Kraken quote currencies (try longest / Z-prefixed first)
     private static readonly (string Suffix, string Code)[] KrakenLegacyQuotes =
     [
         ("ZUSD", "USD"), ("ZEUR", "EUR"), ("ZGBP", "GBP"), ("ZCAD", "CAD"),
@@ -467,9 +478,8 @@ public class KrakenCsvReader : IBrokerReader
         ("JPY",  "JPY"), ("CHF",  "CHF"), ("AUD",  "AUD"), ("SEK",  "SEK"),
     ];
 
-    // ── Asset helpers ─────────────────────────────────────────────────────────
+    // -- Asset helpers ---------------------------------------------------------
 
-    /// Strips Kraken-specific suffixes like ".HOLD" from asset names.
     private static string NormaliseAsset(string asset)
     {
         var dot = asset.IndexOf('.');
@@ -482,7 +492,6 @@ public class KrakenCsvReader : IBrokerReader
         return a is "EUR" or "USD" or "GBP" or "CAD" or "JPY" or "CHF" or "AUD" or "SEK" or "NOK" or "DKK";
     }
 
-    /// Returns the fiat ISO code for stablecoins, or null for true crypto.
     private static string? TryGetFiatEquivalent(string asset)
     {
         var a = NormaliseAsset(asset);
@@ -494,7 +503,7 @@ public class KrakenCsvReader : IBrokerReader
         };
     }
 
-    // ── Rate helper ───────────────────────────────────────────────────────────
+    // -- Rate helper -----------------------------------------------------------
 
     private static async Task<decimal> GetRate(
         RiksbankService riksbank,
@@ -511,7 +520,7 @@ public class KrakenCsvReader : IBrokerReader
         return rate;
     }
 
-    // ── K4 row factory ────────────────────────────────────────────────────────
+    // -- K4 row factory --------------------------------------------------------
 
     private static K4Row MakeRow(string beteckning, decimal antal, DateOnly date,
                                  long proceedsSek, long costSek)
@@ -535,13 +544,7 @@ public class KrakenCsvReader : IBrokerReader
     private static long RoundSek(decimal amount) =>
         (long)Math.Round(amount, MidpointRounding.AwayFromZero);
 
-    private static AssetState GetOrAdd(Dictionary<string, AssetState> dict, string key)
-    {
-        if (!dict.TryGetValue(key, out var s)) dict[key] = s = new AssetState();
-        return s;
-    }
-
-    // ── Date parsing ─────────────────────────────────────────────────────────
+    // -- Date parsing ----------------------------------------------------------
 
     private static readonly string[] KrakenDateFormats =
     [
@@ -562,7 +565,7 @@ public class KrakenCsvReader : IBrokerReader
         return false;
     }
 
-    // ── Header detection ─────────────────────────────────────────────────────
+    // -- Header detection ------------------------------------------------------
 
     private static bool IsTradesHeader(string line) =>
         line.Contains("pair",   StringComparison.OrdinalIgnoreCase) &&
@@ -574,51 +577,26 @@ public class KrakenCsvReader : IBrokerReader
         line.Contains("asset",  StringComparison.OrdinalIgnoreCase) &&
         line.Contains("amount", StringComparison.OrdinalIgnoreCase);
 
-    // ── Private types ─────────────────────────────────────────────────────────
-
-    private sealed class AssetState
-    {
-        public decimal HeldQty     { get; private set; }
-        public decimal AvgCostSek  { get; private set; }
-
-        /// Records a purchase, updating the running average cost per unit (genomsnittsmetoden).
-        public void Buy(decimal qty, decimal totalCostSek)
-        {
-            if (qty <= 0m) return;
-            AvgCostSek = HeldQty == 0m
-                ? totalCostSek / qty
-                : (HeldQty * AvgCostSek + totalCostSek) / (HeldQty + qty);
-            HeldQty += qty;
-        }
-
-        /// Deducts a disposal from holdings and returns the SEK cost basis for the lot.
-        public long Sell(decimal qty)
-        {
-            if (qty <= 0m) return 0L;
-            var costBasis = RoundSek(qty * AvgCostSek);
-            HeldQty = Math.Max(0m, HeldQty - qty);
-            return costBasis;
-        }
-    }
+    // -- Private types ---------------------------------------------------------
 
     private sealed class KrakenTrade
     {
         public DateTime Time   { get; init; }
         public string   Pair   { get; init; } = "";
-        public string   Type   { get; init; } = "";  // "buy" | "sell"
-        public decimal  Cost   { get; init; }        // fiat amount (gross)
-        public decimal  Fee    { get; init; }        // fee in quote currency
-        public decimal  Vol    { get; init; }        // crypto quantity
-        public decimal  Margin { get; init; }        // 0 for spot; > 0 for margin
+        public string   Type   { get; init; } = "";
+        public decimal  Cost   { get; init; }
+        public decimal  Fee    { get; init; }
+        public decimal  Vol    { get; init; }
+        public decimal  Margin { get; init; }
         public string   Misc   { get; init; } = "";
-        public string   Net    { get; init; } = "";  // realized P&L (margin only)
+        public string   Net    { get; init; } = "";
     }
 
-    private sealed class KrakenLedgerEntry
+    private sealed class KrakenTradeSwap
     {
         public DateTime Time          { get; init; }
         public string   SpendAsset    { get; init; } = "";
-        public decimal  SpendAmount   { get; init; } // absolute (positive) value
+        public decimal  SpendAmount   { get; init; }
         public decimal  SpendFee      { get; init; }
         public string   ReceiveAsset  { get; init; } = "";
         public decimal  ReceiveAmount { get; init; }
