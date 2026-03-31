@@ -19,8 +19,7 @@ foreach (var broker in selectedBrokers)
     selections.Add((broker, await ConsoleUi.CollectFilesAsync(broker)));
 
 // ── Output directory ──────────────────────────────────────────────────────────
-var defaultOutput = Path.GetFullPath(
-    Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "output"));
+var defaultOutput = Path.GetFullPath(Path.Combine(Directory.GetCurrentDirectory(), "output"));
 var outputDir = ConsoleUi.PromptOutputDir(defaultOutput);
 
 // ── Confirm ───────────────────────────────────────────────────────────────────
