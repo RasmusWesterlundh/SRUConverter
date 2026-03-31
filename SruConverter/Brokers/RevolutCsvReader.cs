@@ -26,8 +26,8 @@ public class RevolutCsvReader : IBrokerReader
     public string   FilePrompt          => "Consolidated Statement CSV export (consolidated-statement_*.csv)";
 
     public string HelpText =>
-        "Open the Revolut app and go to Profile (bottom right) → Documents → Statements. " +
-        "Tap 'Consolidated statement', select the tax year, and choose CSV as the format. " +
+        "Open the Revolut app and go to Profile  → Documents & Statements. " +
+        "Tap 'Custom Statement', select the tax year, and choose Excel/CSV as the format. " +
         "The exported file is named 'consolidated-statement_YYYY-MM-DD_YYYY-MM-DD_*.csv'. " +
         "Note: only crypto trades are imported from this statement; " +
         "other asset types are not yet supported.";

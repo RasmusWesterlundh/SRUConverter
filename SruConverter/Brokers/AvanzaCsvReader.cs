@@ -34,7 +34,7 @@ public class AvanzaCsvReader : IBrokerReader
         "If you have multiple Avanza accounts, download a separate K4 file for each " +
         "and add them one by one when prompted.";
 
-    public string HelpUrl => "https://www.avanza.se/skatt";
+    public string HelpUrl => "https://www.avanza.se/min-profil/deklaration-kontobesked/avanza-k4.html";
 
     private static readonly string[] CanonicalHeaders =
         ["Sektion", "Antal", "Beteckning", "Datum",
