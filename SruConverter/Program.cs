@@ -33,13 +33,79 @@ if (!ConsoleUi.ConfirmSummary(person, year, selections, outputDir))
 var allRows = new List<SruConverter.Models.K4Row>();
 using var riksbank = new RiksbankService();
 
+// ── Collect trade events from all crypto brokers ──────────────────────────────
+var allEvents = new List<SruConverter.Models.TradeEvent>();
 foreach (var (broker, files) in selections)
 {
-    Console.WriteLine($"  Reading {broker.BrokerName}...");
+    Console.WriteLine($"  Collecting events from {broker.BrokerName}...");
+    var events = await broker.GetTradeEventsAsync(files, riksbank);
+    Console.WriteLine($"    -> {events.Count} events");
+    allEvents.AddRange(events);
+}
+
+// ── Sort chronologically and process with shared genomsnittsmetoden ───────────
+allEvents.Sort((a, b) => a.Timestamp.CompareTo(b.Timestamp));
+
+var cryptoState = new SruConverter.Services.CryptoHoldingsState();
+
+foreach (var evt in allEvents)
+{
+    if (evt.Kind == SruConverter.Models.TradeKind.Buy)
+    {
+        cryptoState.Buy(evt.Asset, evt.Quantity, evt.ValueSek + evt.FeeSek);
+    }
+    else // Sell
+    {
+        var (computedCost, sufficient) = cryptoState.Sell(evt.Asset, evt.Quantity);
+        long costSek;
+
+        if (sufficient)
+        {
+            costSek = computedCost;
+        }
+        else if (evt.FallbackCostSek.HasValue)
+        {
+            Console.WriteLine(
+                $"  NOTE: Using {evt.Source}'s pre-computed cost for {evt.Asset} " +
+                "(insufficient buy history in provided files). " +
+                "Provide full trade history for accurate genomsnittsmetoden.");
+            costSek = evt.FallbackCostSek.Value;
+        }
+        else
+        {
+            Console.WriteLine(
+                $"  WARNING: No cost basis for {evt.Asset} on " +
+                $"{DateOnly.FromDateTime(evt.Timestamp)} — export full trade history.");
+            costSek = computedCost; // 0
+        }
+
+        var proceedsSek = (long)Math.Round(evt.ValueSek - evt.FeeSek, MidpointRounding.AwayFromZero);
+        var vinst   = proceedsSek > costSek ? proceedsSek - costSek : 0L;
+        var forlust = costSek > proceedsSek ? costSek - proceedsSek : 0L;
+
+        allRows.Add(new SruConverter.Models.K4Row
+        {
+            Sektion          = "D",
+            Antal            = evt.Quantity,
+            Beteckning       = evt.Asset,
+            Datum            = DateOnly.FromDateTime(evt.Timestamp).ToString("yyyy-MM-dd"),
+            Forsaljningspris = proceedsSek,
+            Omkostnadsbelopp = costSek,
+            Vinst            = vinst,
+            Forlust          = forlust,
+        });
+    }
+}
+
+// ── Collect direct K4 rows (Avanza stocks, Kraken margin trades) ──────────────
+foreach (var (broker, files) in selections)
+{
+    Console.WriteLine($"  Reading direct rows from {broker.BrokerName}...");
     try
     {
-        var rows = await broker.ReadAsync(files, riksbank);
-        Console.WriteLine($"    -> {rows.Count} rows");
+        var rows = await broker.GetDirectRowsAsync(files, riksbank);
+        if (rows.Count > 0)
+            Console.WriteLine($"    -> {rows.Count} direct rows");
         allRows.AddRange(rows);
     }
     catch (Exception ex)

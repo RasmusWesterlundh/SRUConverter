@@ -1,51 +1,77 @@
-using System.Globalization;
+﻿using System.Globalization;
 using SruConverter.Models;
 using SruConverter.Services;
 
 namespace SruConverter.Brokers;
 
 /// <summary>
-/// Reads Revolut's "Consolidated Statement" CSV export for crypto trades.
-/// The file contains a summary block at the top followed by a
-/// "Transactions for Crypto" section with one row per disposal event.
+/// Reads Revolut crypto export files and emits TradeEvents for the shared genomsnittsmetoden.
 ///
-/// Expected columns (after the "Date acquired," header line):
-///   Date acquired, Date sold, Token name, Qty, Cost basis, Gross proceeds, Gross PnL
+/// Supports two file formats (auto-detected by header):
 ///
-/// Amounts carry a currency prefix (e.g. "$1,234.56", "€500") and are detected
-/// per-row, so mixed-currency reports are handled correctly.
-/// Foreign amounts are converted to SEK using Riksbanken's daily rate for the
-/// sale date; falls back to the monthly average if the date is a non-banking day.
+/// A. crypto-account-statement_*.csv  (raw transactions, values already in SEK)
+///    Header: Symbol,Type,Quantity,Price,Value,Fees,Date
+///    Handles: Buy, Sell, Learn reward; skips Send and other types.
 ///
-/// Per Skatteverket, crypto is reported in K4 Sektion D.
+/// B. trading-account-statement_*.csv  (or old Consolidated Statement)
+///    Header contains both "Date acquired" and "Date sold" columns.
+///    Emits Sell events with FallbackCostSek from Revolut's own cost basis.
+///    Rows for assets that also appear in a crypto-account Sell are skipped
+///    to avoid double-counting.
+///
+/// Providing BOTH files gives the most accurate results: the crypto-account file
+/// covers acquisitions (Buy) and explicit disposals (Sell), while the trading-account
+/// file covers disposals of assets that were transferred out (Send) rather than sold.
+///
+/// Per Skatteverket, all crypto assets are reported in K4 Sektion D.
 /// </summary>
 public class RevolutCsvReader : IBrokerReader
 {
     public string   BrokerName          => "Revolut";
     public string[] SupportedExtensions => [".csv"];
-    public string   FilePrompt          => "Consolidated Statement CSV export (consolidated-statement_*.csv)";
+    public string   FilePrompt          => "Crypto Account Statement and/or Trading Account Statement CSV";
 
     public string HelpText =>
-        "Open the Revolut app and go to Profile  → Documents & Statements. " +
-        "Tap 'Custom Statement', select the tax year, and choose Excel/CSV as the format. " +
-        "The exported file is named 'consolidated-statement_YYYY-MM-DD_YYYY-MM-DD_*.csv'. " +
-        "Note: only crypto trades are imported from this statement; " +
-        "other asset types are not yet supported.";
+        "Open the Revolut app and go to Account Settings -> Documents & Statements -> New Export.\n\n" +
+        "  * Crypto Account Statement (crypto-account-statement_*.csv): " +
+        "Select 'Account Statement', choose 'Crypto' as the account type, set the date range, " +
+        "and export as CSV. This file contains all Buy, Sell, Send, and Learn reward transactions " +
+        "with values already expressed in SEK.\n\n" +
+        "  * Trading Account Statement (trading-account-statement_*.csv): " +
+        "Same path but choose 'Trading' as the account type (or use the old Consolidated Statement). " +
+        "This file contains disposal events with Revolut's pre-computed cost basis, " +
+        "which is used as a fallback when the crypto-account file is not provided.\n\n" +
+        "Providing BOTH files gives the most accurate results. The crypto-account file is " +
+        "used for acquisitions and explicit sells; the trading-account file covers assets " +
+        "transferred out (Send) that are not present in the crypto-account file.";
 
-    public string HelpUrl => "https://help.revolut.com/en-SE/help/profile/documents-and-statements/how-do-i-get-a-statement/";
+    public string HelpUrl => "https://www.revolut.com/help/profile/documents-and-statements/how-do-i-get-a-statement/";
+
+    // -- Validation ------------------------------------------------------------
 
     public Task<string?> ValidateFileAsync(string filePath)
     {
         try
         {
-            var found = File.ReadLines(filePath, System.Text.Encoding.UTF8)
-                .Take(50)
-                .Any(l => l.TrimStart().StartsWith("Date acquired,", StringComparison.OrdinalIgnoreCase));
+            var lines = File.ReadLines(filePath, System.Text.Encoding.UTF8).Take(50).ToList();
+            var firstLine = lines.FirstOrDefault() ?? "";
 
-            return Task.FromResult(found
-                ? null
-                : (string?)"Could not find a 'Date acquired,' header in the first 50 lines. " +
-                           "Is this a Revolut Consolidated Statement CSV export?");
+            if (IsCryptoAccountHeader(firstLine))
+                return Task.FromResult<string?>(null);
+
+            if (lines.Any(l =>
+                    l.Contains("Date acquired", StringComparison.OrdinalIgnoreCase) &&
+                    l.Contains("Date sold",     StringComparison.OrdinalIgnoreCase)))
+                return Task.FromResult<string?>(null);
+
+            // Old consolidated statement: "Date acquired," starts its own line
+            if (lines.Any(l => l.TrimStart().StartsWith("Date acquired,", StringComparison.OrdinalIgnoreCase)))
+                return Task.FromResult<string?>(null);
+
+            return Task.FromResult<string?>(
+                "Could not recognise this as a Revolut export. " +
+                "Expected a Crypto Account Statement (Symbol,Type,Quantity,Price,Value,Fees,Date header) " +
+                "or a Trading Account Statement / Consolidated Statement (with 'Date acquired' and 'Date sold' columns).");
         }
         catch (Exception ex)
         {
@@ -53,110 +79,316 @@ public class RevolutCsvReader : IBrokerReader
         }
     }
 
-    public async Task<List<K4Row>> ReadAsync(IEnumerable<string> filePaths, RiksbankService riksbank)
-    {
-        var rows       = new List<K4Row>();
-        var loggedKeys = new HashSet<string>(); // suppress duplicate rate log lines
+    // -- GetTradeEventsAsync ---------------------------------------------------
 
+    public async Task<List<TradeEvent>> GetTradeEventsAsync(
+        IEnumerable<string> filePaths, RiksbankService riksbank)
+    {
+        var events                  = new List<TradeEvent>();
+        var loggedKeys              = new HashSet<string>();
+        var assetsWithExplicitSells = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var cryptoFiles  = new List<string>();
+        var tradingFiles = new List<string>();
+
+        // Classify each file by format.
         foreach (var path in filePaths)
         {
-            var lines           = File.ReadAllLines(path, System.Text.Encoding.UTF8);
-            bool inTransactions = false;
-
-            foreach (var line in lines)
-            {
-                var trimmed = line.Trim();
-                if (string.IsNullOrEmpty(trimmed)) continue;
-
-                if (trimmed.StartsWith("Date acquired,"))
-                {
-                    inTransactions = true;
-                    continue;
-                }
-
-                if (!inTransactions) continue;
-
-                var cols = CsvHelper.SplitLine(trimmed);
-                if (cols.Count < 7) continue;
-
-                var dateSoldStr = cols[1].Trim();
-                var token       = cols[2].Trim().ToUpperInvariant();
-                var qty         = CsvHelper.ParseDecimal(cols[3]);
-
-                if (!CsvHelper.TryParseAmount(cols[4], out var cost,     out var costCurrency) ||
-                    !CsvHelper.TryParseAmount(cols[5], out var proceeds, out var proceedsCurrency))
-                {
-                    Console.WriteLine($"  WARNING: Could not parse amounts for {token}, skipping row.");
-                    continue;
-                }
-
-                if (costCurrency != proceedsCurrency)
-                    Console.WriteLine($"  WARNING: {token} — cost in {costCurrency} but proceeds in " +
-                                      $"{proceedsCurrency}. Using proceeds currency for conversion.");
-
-                var currency = proceedsCurrency;
-
-                if (!TryParseDate(dateSoldStr, out var dateSold))
-                {
-                    Console.WriteLine($"  WARNING: Could not parse date '{dateSoldStr}', skipping row.");
-                    continue;
-                }
-
-                // Get SEK rate for this row's specific currency and sale date.
-                // RiksbankService bulk-caches the full year on first call per currency, so this is fast.
-                decimal rate;
-                if (currency == "SEK")
-                {
-                    rate = 1m;
-                }
-                else
-                {
-                    rate = await riksbank.GetRateForDateAsync(currency, dateSold);
-                    var logKey = $"{currency}:{dateSold:yyyy-MM}";
-                    if (loggedKeys.Add(logKey))
-                        Console.WriteLine($"  {currency}/SEK {dateSold:yyyy-MM}: {rate}");
-                }
-
-                var costSek     = (long)Math.Round(cost     * rate, MidpointRounding.AwayFromZero);
-                var proceedsSek = (long)Math.Round(proceeds * rate, MidpointRounding.AwayFromZero);
-                var vinst       = proceedsSek > costSek ? proceedsSek - costSek : 0L;
-                var forlust     = costSek > proceedsSek ? costSek - proceedsSek : 0L;
-
-                rows.Add(new K4Row
-                {
-                    Sektion          = "D",  // Skatteverket: crypto → K4 Sektion D
-                    Antal            = qty,
-                    Beteckning       = token,
-                    Datum            = dateSold.ToString("yyyy-MM-dd"),
-                    Forsaljningspris = proceedsSek,
-                    Omkostnadsbelopp = costSek,
-                    Vinst            = vinst,
-                    Forlust          = forlust,
-                });
-            }
+            var firstLine = File.ReadLines(path, System.Text.Encoding.UTF8).FirstOrDefault() ?? "";
+            if (IsCryptoAccountHeader(firstLine))
+                cryptoFiles.Add(path);
+            else
+                tradingFiles.Add(path);
         }
 
-        return rows;
+        // Pass 1: process crypto-account files first, building assetsWithExplicitSells.
+        foreach (var path in cryptoFiles)
+        {
+            var lines = File.ReadAllLines(path, System.Text.Encoding.UTF8);
+            var evts  = ParseCryptoAccountFile(lines, assetsWithExplicitSells);
+            events.AddRange(evts);
+        }
+
+        // Pass 2: process trading-account files, skipping assets already covered above.
+        foreach (var path in tradingFiles)
+        {
+            var lines = File.ReadAllLines(path, System.Text.Encoding.UTF8);
+            var evts  = await ParseTradingAccountFile(lines, assetsWithExplicitSells, riksbank, loggedKeys);
+            events.AddRange(evts);
+        }
+
+        return events;
     }
 
-    // ── Date parsing ─────────────────────────────────────────────────────────
+    // -- Crypto account statement parser (Format A) ----------------------------
 
-    private static readonly string[] DateFormats =
+    private static List<TradeEvent> ParseCryptoAccountFile(
+        string[] lines,
+        HashSet<string> assetsWithExplicitSells)
+    {
+        var events = new List<TradeEvent>();
+        var colIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var raw in lines)
+        {
+            var cols = CsvHelper.SplitLine(raw.Trim());
+            if (cols.Count == 0) continue;
+
+            if (colIdx.Count == 0)
+            {
+                if (!IsCryptoAccountHeader(raw.Trim())) continue;
+                for (int i = 0; i < cols.Count; i++)
+                    colIdx[cols[i].Trim()] = i;
+                continue;
+            }
+
+            string Get(string col) =>
+                colIdx.TryGetValue(col, out int i) && i < cols.Count ? cols[i].Trim() : "";
+
+            var symbol   = Get("Symbol").ToUpperInvariant();
+            var type     = Get("Type").Trim();
+            var qtyStr   = Get("Quantity");
+            var valueStr = Get("Value");
+            var feesStr  = Get("Fees");
+            var dateStr  = Get("Date");
+
+            if (string.IsNullOrEmpty(symbol)) continue;
+
+            if (!decimal.TryParse(qtyStr.Replace(",", ""), NumberStyles.Any,
+                    CultureInfo.InvariantCulture, out var qty) || qty == 0m)
+                continue;
+
+            if (!TryParseCryptoDateTime(dateStr, out var timestamp))
+            {
+                Console.WriteLine($"  WARNING (Revolut): Could not parse date '{dateStr}', skipping row.");
+                continue;
+            }
+
+            var typeNorm = type.Trim();
+
+            if (typeNorm.Equals("Learn reward", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine(
+                    $"  NOTE (Revolut): Learn reward of {qty} {symbol} on " +
+                    $"{DateOnly.FromDateTime(timestamp):yyyy-MM-dd} — cost basis set to 0. " +
+                    "Declare this amount separately as income (Tjänst) in your tax return.");
+                events.Add(new TradeEvent
+                {
+                    Timestamp = timestamp,
+                    Asset     = symbol,
+                    Quantity  = qty,
+                    ValueSek  = 0m,
+                    FeeSek    = 0m,
+                    Kind      = TradeKind.Buy,
+                    Source    = "Revolut",
+                });
+            }
+            else if (typeNorm.Equals("Buy", StringComparison.OrdinalIgnoreCase))
+            {
+                events.Add(new TradeEvent
+                {
+                    Timestamp = timestamp,
+                    Asset     = symbol,
+                    Quantity  = qty,
+                    ValueSek  = ParseSekAmount(valueStr),
+                    FeeSek    = ParseSekAmount(feesStr),
+                    Kind      = TradeKind.Buy,
+                    Source    = "Revolut",
+                });
+            }
+            else if (typeNorm.Equals("Sell", StringComparison.OrdinalIgnoreCase))
+            {
+                assetsWithExplicitSells.Add(symbol);
+                events.Add(new TradeEvent
+                {
+                    Timestamp = timestamp,
+                    Asset     = symbol,
+                    Quantity  = qty,
+                    ValueSek  = ParseSekAmount(valueStr),
+                    FeeSek    = ParseSekAmount(feesStr),
+                    Kind      = TradeKind.Sell,
+                    Source    = "Revolut",
+                });
+            }
+            else if (typeNorm.Equals("Send", StringComparison.OrdinalIgnoreCase))
+            {
+                // Per Skatteverket: paying with crypto is a taxable disposal.
+                // A "Send" can also be a transfer to your own wallet (not taxable).
+                // We treat it as taxable when Revolut reports a non-zero Value.
+                // If Value is 0 we assume it's an internal transfer and skip it.
+                var sendValue = ParseSekAmount(valueStr);
+                if (sendValue > 0m)
+                {
+                    Console.WriteLine(
+                        $"  NOTE (Revolut): 'Send' of {qty} {symbol} on " +
+                        $"{DateOnly.FromDateTime(timestamp):yyyy-MM-dd} treated as taxable disposal. " +
+                        "If this was a transfer to your own wallet, remove it manually from the SRU output.");
+                    assetsWithExplicitSells.Add(symbol);
+                    events.Add(new TradeEvent
+                    {
+                        Timestamp = timestamp,
+                        Asset     = symbol,
+                        Quantity  = qty,
+                        ValueSek  = sendValue,
+                        FeeSek    = ParseSekAmount(feesStr),
+                        Kind      = TradeKind.Sell,
+                        Source    = "Revolut",
+                    });
+                }
+                // Value == 0: internal transfer, skip silently.
+            }
+            // Other types -> skip
+        }
+
+        return events;
+    }
+
+    // -- Trading account statement parser (Format B) ---------------------------
+
+    private async Task<List<TradeEvent>> ParseTradingAccountFile(
+        string[] lines,
+        HashSet<string> assetsWithExplicitSells,
+        RiksbankService riksbank,
+        HashSet<string> loggedKeys)
+    {
+        var events = new List<TradeEvent>();
+        var colIdx = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var raw in lines)
+        {
+            var trimmed = raw.Trim();
+            if (string.IsNullOrEmpty(trimmed)) continue;
+
+            var cols = CsvHelper.SplitLine(trimmed);
+            if (cols.Count == 0) continue;
+
+            // Detect header line: must contain both "Date acquired" and "Date sold".
+            if (colIdx.Count == 0)
+            {
+                if (trimmed.Contains("Date acquired", StringComparison.OrdinalIgnoreCase) &&
+                    trimmed.Contains("Date sold",     StringComparison.OrdinalIgnoreCase))
+                {
+                    for (int i = 0; i < cols.Count; i++)
+                        colIdx[cols[i].Trim()] = i;
+                }
+                continue;
+            }
+
+            string Get(string col) =>
+                colIdx.TryGetValue(col, out int i) && i < cols.Count ? cols[i].Trim() : "";
+
+            // Flexible column name detection.
+            var dateSoldStr      = Get("Date sold");
+            var asset            = (Get("Symbol") is { Length: > 0 } sym ? sym
+                                    : Get("Token name")).ToUpperInvariant();
+            var qtyStr           = Get("Quantity") is { Length: > 0 } q ? q : Get("Qty");
+            var proceedsStr      = Get("Gross proceeds");
+            var costStr          = Get("Cost basis");
+            var feesStr          = Get("Fees");
+            var currencyCode     = Get("Currency");
+
+            if (string.IsNullOrEmpty(asset) || string.IsNullOrEmpty(dateSoldStr)) continue;
+
+            // Skip if this asset had explicit Sell events in the crypto-account file.
+            if (assetsWithExplicitSells.Contains(asset)) continue;
+
+            if (!DateOnly.TryParseExact(dateSoldStr, "yyyy-MM-dd",
+                    CultureInfo.InvariantCulture, DateTimeStyles.None, out var dateSold))
+            {
+                Console.WriteLine($"  WARNING (Revolut): Could not parse 'Date sold' '{dateSoldStr}', skipping.");
+                continue;
+            }
+
+            if (!decimal.TryParse(qtyStr.Replace(",", ""), NumberStyles.Any,
+                    CultureInfo.InvariantCulture, out var qty) || qty == 0m)
+                continue;
+
+            if (!decimal.TryParse(proceedsStr.Replace(",", ""), NumberStyles.Any,
+                    CultureInfo.InvariantCulture, out var proceeds))
+                continue;
+
+            decimal.TryParse(costStr.Replace(",", ""), NumberStyles.Any,
+                CultureInfo.InvariantCulture, out var costBasis);
+
+            decimal.TryParse(feesStr.Replace(",", ""), NumberStyles.Any,
+                CultureInfo.InvariantCulture, out var fees);
+
+            if (string.IsNullOrEmpty(currencyCode)) currencyCode = "USD";
+
+            decimal rate = await GetRate(riksbank, currencyCode, dateSold, loggedKeys);
+
+            var timestamp    = dateSold.ToDateTime(TimeOnly.MinValue);
+            var valueSek     = proceeds  * rate;
+            var feeSek       = fees      * rate;
+            var fallbackCost = (long)Math.Round(costBasis * rate, MidpointRounding.AwayFromZero);
+
+            events.Add(new TradeEvent
+            {
+                Timestamp       = timestamp,
+                Asset           = asset,
+                Quantity        = qty,
+                ValueSek        = valueSek,
+                FeeSek          = feeSek,
+                Kind            = TradeKind.Sell,
+                Source          = "Revolut",
+                FallbackCostSek = fallbackCost,
+            });
+        }
+
+        return events;
+    }
+
+    // -- Helpers ---------------------------------------------------------------
+
+    private static bool IsCryptoAccountHeader(string line) =>
+        line.Contains("Symbol",   StringComparison.OrdinalIgnoreCase) &&
+        line.Contains("Type",     StringComparison.OrdinalIgnoreCase) &&
+        line.Contains("Quantity", StringComparison.OrdinalIgnoreCase) &&
+        line.Contains("Fees",     StringComparison.OrdinalIgnoreCase) &&
+        line.Contains("Date",     StringComparison.OrdinalIgnoreCase) &&
+        !line.Contains("Date acquired", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Strips the " SEK" suffix, commas, narrow no-break spaces (U+202F), then parses as decimal.
+    /// </summary>
+    private static decimal ParseSekAmount(string s)
+    {
+        s = s.Replace("\u202F", "")
+             .Replace(" SEK", "", StringComparison.OrdinalIgnoreCase)
+             .Replace(",", "")
+             .Trim();
+        return decimal.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d : 0m;
+    }
+
+    private static readonly string[] CryptoDateFormats =
     [
-        "MMM d, yyyy",    // Revolut: "Jan 17, 2025"
-        "MMM dd, yyyy",   // Revolut: "Jan 17, 2025" (zero-padded day)
-        "yyyy-MM-dd",     // ISO 8601
-        "dd/MM/yyyy",     // European
-        "M/d/yyyy",       // US
-        "d/M/yyyy",       // EU alternative
+        "MMM d, yyyy, h:mm:ss tt",
+        "MMM dd, yyyy, h:mm:ss tt",
     ];
 
-    private static bool TryParseDate(string s, out DateOnly date)
+    private static bool TryParseCryptoDateTime(string s, out DateTime dt)
     {
-        foreach (var fmt in DateFormats)
-            if (DateOnly.TryParseExact(s, fmt, CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out date)) return true;
-        date = default;
+        // Replace narrow no-break space (U+202F) before AM/PM with a regular space.
+        s = s.Replace('\u202F', ' ');
+        foreach (var fmt in CryptoDateFormats)
+            if (DateTime.TryParseExact(s, fmt, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out dt)) return true;
+        dt = default;
         return false;
+    }
+
+    private static async Task<decimal> GetRate(
+        RiksbankService riksbank,
+        string currency,
+        DateOnly date,
+        HashSet<string> loggedKeys)
+    {
+        if (currency is "SEK") return 1m;
+
+        var rate   = await riksbank.GetRateForDateAsync(currency, date);
+        var logKey = $"{currency}:{date:yyyy-MM}";
+        if (loggedKeys.Add(logKey))
+            Console.WriteLine($"  {currency}/SEK {date:yyyy-MM}: {rate}");
+        return rate;
     }
 }
