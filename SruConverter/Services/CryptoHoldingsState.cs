@@ -30,6 +30,8 @@ public sealed class CryptoHoldingsState
     public (long CostSek, bool Sufficient) Sell(string asset, decimal qty)
     {
         var h = GetOrCreate(asset);
+        // Allow 0.1 % rounding slack — floating-point accumulation across many small
+        // trades can leave the tracked balance fractionally below the sold quantity.
         bool sufficient = h.HeldQty >= qty * 0.999m;
         return (h.Sell(qty), sufficient);
     }
@@ -43,7 +45,7 @@ public sealed class CryptoHoldingsState
 }
 
 /// <summary>Per-asset running average-cost state.</summary>
-public sealed class AssetHolding
+internal sealed class AssetHolding
 {
     public decimal HeldQty    { get; private set; }
     public decimal AvgCostSek { get; private set; }
