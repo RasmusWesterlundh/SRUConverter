@@ -1,0 +1,16 @@
+# SruConverter — .gitignore
+# All actual input data and personal information is excluded from version control.
+
+# Input data (personal financial data and PII — never commit)
+indata/
+
+# Generated SRU output files (contain personal data)
+SruConverter/output/
+output/
+
+# Saved personal details (PII — written next to the executable at runtime)
+**/PersonalDetails.json
+
+# .NET build artifacts
+SruConverter/bin/
+SruConverter/obj/
