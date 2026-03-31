@@ -1,4 +1,3 @@
-using System.Text.Json;
 using SruConverter.Brokers;
 using SruConverter.Models;
 
@@ -45,7 +44,7 @@ public static class ConsoleUi
         {
             if (!File.Exists(PersonalDetailsPath)) return null;
             var json = File.ReadAllText(PersonalDetailsPath);
-            return JsonSerializer.Deserialize<PersonInfo>(json);
+            return System.Text.Json.JsonSerializer.Deserialize(json, AppJsonContext.Default.PersonInfo);
         }
         catch { return null; }
     }
@@ -54,7 +53,7 @@ public static class ConsoleUi
     {
         try
         {
-            var json = JsonSerializer.Serialize(p, new JsonSerializerOptions { WriteIndented = true });
+            var json = System.Text.Json.JsonSerializer.Serialize(p, AppJsonContext.Default.PersonInfo);
             File.WriteAllText(PersonalDetailsPath, json);
         }
         catch (Exception ex)

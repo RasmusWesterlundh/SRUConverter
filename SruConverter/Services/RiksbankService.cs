@@ -1,5 +1,4 @@
 using System.Net.Http.Json;
-using System.Text.Json.Serialization;
 
 namespace SruConverter.Services;
 
@@ -57,7 +56,12 @@ public class RiksbankService : IDisposable
         // Sum monthly averages weighted by observation count would be ideal, but the
         // annual-aggregate endpoint is a single call and gives the authoritative figure.
         var url = $"ObservationAggregates/{seriesId}/Y/{year}-01-01/{year}-12-31";
-        var aggs = await _http.GetFromJsonAsync<List<ObservationAggregate>>(url);
+        var response = await _http.GetAsync(url);
+        if (!response.IsSuccessStatusCode)
+            throw new Exception($"No annual average found for {currency} in {year}.");
+        var json = await response.Content.ReadAsStringAsync();
+        var aggs = System.Text.Json.JsonSerializer.Deserialize(json,
+            AppJsonContext.Default.ListObservationAggregate);
         var match = aggs?.FirstOrDefault(a => a.Year == year);
         if (match?.Average == null)
             throw new Exception($"No annual average found for {currency} in {year}.");
@@ -84,8 +88,8 @@ public class RiksbankService : IDisposable
         if (!response.IsSuccessStatusCode) return;
 
         var json = await response.Content.ReadAsStringAsync();
-        var obs = System.Text.Json.JsonSerializer.Deserialize<List<Observation>>(json,
-            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        var obs = System.Text.Json.JsonSerializer.Deserialize(json,
+            AppJsonContext.Default.ListObservation);
 
         if (obs == null) return;
         foreach (var o in obs)
@@ -99,8 +103,8 @@ public class RiksbankService : IDisposable
         if (!response.IsSuccessStatusCode) return;
 
         var json = await response.Content.ReadAsStringAsync();
-        var aggs = System.Text.Json.JsonSerializer.Deserialize<List<ObservationAggregate>>(json,
-            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        var aggs = System.Text.Json.JsonSerializer.Deserialize(json,
+            AppJsonContext.Default.ListObservationAggregate);
 
         if (aggs == null) return;
         foreach (var a in aggs)
@@ -112,18 +116,7 @@ public class RiksbankService : IDisposable
     }
 
     // ── JSON models ───────────────────────────────────────────────────────────
-
-    private class Observation
-    {
-        [JsonPropertyName("date")]  public string?  Date  { get; set; }
-        [JsonPropertyName("value")] public decimal? Value { get; set; }
-    }
-
-    private class ObservationAggregate
-    {
-        [JsonPropertyName("year")]    public int?     Year    { get; set; }
-        [JsonPropertyName("seqNr")]   public int?     SeqNr   { get; set; }
-        [JsonPropertyName("average")] public decimal? Average { get; set; }
-    }
+    // Defined as internal top-level types (in RiksbankModels.cs) so the
+    // source-generated AppJsonContext can reference them.
 }
 
