@@ -1,0 +1,78 @@
+name: Build and Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (optional, uses latest if not specified)'
+        required: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            runtime: win-x64
+            artifact: SruConverter-win-x64.exe
+          - os: ubuntu-latest
+            runtime: linux-x64
+            artifact: SruConverter-linux-x64
+          - os: macos-latest
+            runtime: osx-x64
+            artifact: SruConverter-osx-x64
+          - os: macos-latest
+            runtime: osx-arm64
+            artifact: SruConverter-osx-arm64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Restore dependencies
+      run: dotnet restore SruConverter/SruConverter.csproj
+
+    - name: Build and Publish
+      run: |
+        dotnet publish SruConverter/SruConverter.csproj \
+          -c Release \
+          -r ${{ matrix.runtime }} \
+          --self-contained true \
+          -p:PublishSingleFile=true \
+          -p:PublishTrimmed=true \
+          -p:IncludeNativeLibrariesForSelfExtract=true \
+          -o ./publish/${{ matrix.runtime }}
+
+    - name: Prepare artifact (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        Move-Item ./publish/${{ matrix.runtime }}/SruConverter.exe ./publish/${{ matrix.artifact }}
+
+    - name: Prepare artifact (Unix)
+      if: matrix.os != 'windows-latest'
+      run: |
+        mv ./publish/${{ matrix.runtime }}/SruConverter ./publish/${{ matrix.artifact }}
+        chmod +x ./publish/${{ matrix.artifact }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact }}
+        path: ./publish/${{ matrix.artifact }}
+
+    - name: Upload to Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ./publish/${{ matrix.artifact }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
