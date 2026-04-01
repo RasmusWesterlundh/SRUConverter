@@ -61,3 +61,14 @@ jobs:
         files: ./publish/${{ matrix.artifact }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Upload to latest pre-release (manual run)
+      if: github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
+      with:
+        tag_name: latest
+        name: Latest build (main)
+        prerelease: true
+        files: ./publish/${{ matrix.artifact }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
