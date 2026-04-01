@@ -4,29 +4,21 @@ on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to build (optional, uses latest if not specified)'
-        required: false
 
 jobs:
   build:
-    name: Build ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.runtime }}
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - os: windows-latest
-            runtime: win-x64
+          - runtime: win-x64
             artifact: SruConverter-win-x64.exe
-          - os: ubuntu-latest
-            runtime: linux-x64
+          - runtime: linux-x64
             artifact: SruConverter-linux-x64
-          - os: macos-latest
-            runtime: osx-x64
+          - runtime: osx-x64
             artifact: SruConverter-osx-x64
-          - os: macos-latest
-            runtime: osx-arm64
+          - runtime: osx-arm64
             artifact: SruConverter-osx-arm64
 
     steps:
@@ -38,30 +30,23 @@ jobs:
       with:
         dotnet-version: '10.0.x'
 
-    - name: Restore dependencies
-      run: dotnet restore SruConverter/SruConverter.csproj
-
-    - name: Build and Publish
+    - name: Publish
       run: |
-        dotnet publish SruConverter/SruConverter.csproj \
+        dotnet publish SruConverter.csproj \
           -c Release \
           -r ${{ matrix.runtime }} \
           --self-contained true \
           -p:PublishSingleFile=true \
           -p:PublishTrimmed=true \
           -p:IncludeNativeLibrariesForSelfExtract=true \
-          -o ./publish/${{ matrix.runtime }}
+          -o ./publish
 
-    - name: Prepare artifact (Windows)
-      if: matrix.os == 'windows-latest'
+    - name: Rename artifact
       run: |
-        Move-Item ./publish/${{ matrix.runtime }}/SruConverter.exe ./publish/${{ matrix.artifact }}
-
-    - name: Prepare artifact (Unix)
-      if: matrix.os != 'windows-latest'
-      run: |
-        mv ./publish/${{ matrix.runtime }}/SruConverter ./publish/${{ matrix.artifact }}
-        chmod +x ./publish/${{ matrix.artifact }}
+        src=./publish/SruConverter
+        [ -f "./publish/SruConverter.exe" ] && src=./publish/SruConverter.exe
+        mv "$src" ./publish/${{ matrix.artifact }}
+        chmod +x ./publish/${{ matrix.artifact }} 2>/dev/null || true
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -71,7 +56,7 @@ jobs:
 
     - name: Upload to Release
       if: github.event_name == 'release'
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
       with:
         files: ./publish/${{ matrix.artifact }}
       env:
