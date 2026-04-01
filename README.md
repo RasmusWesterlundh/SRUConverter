@@ -2,7 +2,7 @@
 
 A cross-platform .NET console app that generates Swedish tax declaration files (`.SRU`) for **K4** from broker export files.
 
-Supports **Avanza** (stocks & ETFs), **Revolut** (crypto), and **Kraken** (crypto spot, swaps, and margin trades). Currency conversion is handled automatically via [Riksbanken's public API](https://www.riksbank.se/sv/statistik/sok-rantor--valutakurser/).
+Supports **Avanza** (stocks & ETFs), **Revolut** (crypto), and **Kraken** (crypto spot, swaps, and margin trades). Trades in foreign currencies are automatically converted to actual day-of-trade exchange rates based on [Riksbanken's public API](https://www.riksbank.se/sv/statistik/sok-rantor--valutakurser/).
 
 ---
 
