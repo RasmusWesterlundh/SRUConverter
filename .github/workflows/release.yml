@@ -48,20 +48,17 @@ jobs:
         mv "$src" ./publish/${{ matrix.artifact }}
         chmod +x ./publish/${{ matrix.artifact }} 2>/dev/null || true
 
-    - name: Zip artifact
-      run: zip -j ./publish/${{ matrix.artifact }}.zip ./publish/${{ matrix.artifact }}
-
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact }}
-        path: ./publish/${{ matrix.artifact }}.zip
+        path: ./publish/${{ matrix.artifact }}
 
     - name: Upload to Release
       if: github.event_name == 'release'
       uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
       with:
-        files: ./publish/${{ matrix.artifact }}.zip
+        files: ./publish/${{ matrix.artifact }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -72,6 +69,6 @@ jobs:
         tag_name: latest
         name: Latest build (main)
         prerelease: true
-        files: ./publish/${{ matrix.artifact }}.zip
+        files: ./publish/${{ matrix.artifact }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
